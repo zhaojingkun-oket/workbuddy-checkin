@@ -1,0 +1,71 @@
+name: WorkBuddy 每日签到
+
+# 云端无人值守签到：无需本机开机，由 GitHub Actions 按点触发。
+#
+# 时区说明：Actions 的 cron 一律按 UTC 解释，本地无时区概念。
+# 下面是北京时间 09:00（对应 UTC 01:00），第二个时间点为补签兜底。
+# 脚本幂等，重复执行只会返回「今日已签到」，无副作用。
+
+on:
+  schedule:
+    # UTC 01:00 = 北京时间 09:00
+    - cron: '0 1 * * *'
+    # UTC 05:00 = 北京时间 13:00（9 点那次失败时的兜底）
+    - cron: '0 5 * * *'
+  # 支持在网页上手动点一次，用于首次验证
+  workflow_dispatch:
+
+# 同一时间只跑一个实例；补签时间点若与上一次重叠不会并发重复请求
+concurrency:
+  group: workbuddy-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Node 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 执行签到
+        id: checkin
+        env:
+          # 登录态存在仓库 Secret 中，不落盘、不进日志
+          WORKBUDDY_AUTH: ${{ secrets.WORKBUDDY_AUTH }}
+          # 启动前随机等待 0~120 秒，避开整点请求高峰
+          WB_CHECKIN_JITTER: '120'
+        run: node cloud/checkin.js
+
+      - name: 写入执行摘要
+        if: always()
+        run: |
+          {
+            echo "## WorkBuddy 每日签到"
+            echo ""
+            echo "- 结果：\`${{ steps.checkin.outputs.result }}\`"
+            echo "- 说明：${{ steps.checkin.outputs.detail }}"
+            if [ -n "${{ steps.checkin.outputs.expiry_days }}" ]; then
+              echo "- 令牌剩余有效期：${{ steps.checkin.outputs.expiry_days }} 天"
+            fi
+            echo "- 触发时间（UTC）：$(date -u '+%Y-%m-%d %H:%M:%S')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 令牌临近过期时改变步骤结论，触发 GitHub 的失败邮件，避免忘记重新导出
+      - name: 令牌到期预警
+        if: steps.checkin.outputs.expiry_warning == 'true'
+        run: |
+          echo "::error::登录态令牌仅剩 ${{ steps.checkin.outputs.expiry_days }} 天有效期，请在本机运行 node cloud/export-auth.js 重新导出，并更新仓库 Secret WORKBUDDY_AUTH。"
+          exit 1
+
+      # 失败时把结论推到 Actions 摘要，便于一眼看出是令牌过期还是网络问题。
+      # 邮件通知由 GitHub 账号的默认通知设置承担（失败会发邮件给仓库 owner）。
+      - name: 失败提示
+        if: failure()
+        run: |
+          echo "::error::签到未成功，请查看上方日志。若是令牌过期，请在本机重新导出登录态并更新仓库 Secret WORKBUDDY_AUTH。"
