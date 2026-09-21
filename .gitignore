@@ -1,0 +1,9 @@
+node_modules/
+logs/
+cloud/auth.json
+auth.json
+*.info
+.env
+
+# 本地工作记录，不入公开仓库
+.workbuddy/
