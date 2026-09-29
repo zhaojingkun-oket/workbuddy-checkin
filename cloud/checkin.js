@@ -188,14 +188,46 @@ function pick(obj, keys) {
 const CHAT_ENABLED = (process.env.WB_SEND_MESSAGE || '1') !== '0';
 const CHAT_MODEL = process.env.WB_CHAT_MODEL || 'hy3-free';
 const CHAT_TEXT = process.env.WB_CHAT_TEXT || '你好';
+// 2026-09-29 实测：两个域名的 /v2/chat/completions 都存在（v1 是 404），
+// 且只支持流式请求——非流式返回 HTTP 400 code=11101
+// "Non-stream chat request is currently not supported"
 const CHAT_HOSTS = ['https://copilot.tencent.com', 'https://www.workbuddy.cn'];
-const CHAT_PATHS = ['/v2/chat/completions', '/v1/chat/completions'];
+const CHAT_PATH = '/v2/chat/completions';
 
 /**
- * 向聊天网关发送一条短消息，在账号下产生使用记录。
- * 桌面端主聊天走本地代理 + 流式协议，无公开的纯 HTTP 收消息端点，
- * 因此按「域名 × 路径」逐个尝试 OpenAI 兼容端点；任何一个 2xx 即视为成功。
- * 全部失败只记录结论，绝不抛出、绝不影响签到退出码。
+ * 解析 SSE（server-sent events）流式响应。
+ * @returns {{ok:boolean, content:string, errMsg:string|null}}
+ *   ok = 正常收到 [DONE] 或聚合到了至少一段回复内容
+ */
+function parseSSE(text) {
+  let content = '';
+  let sawDone = false;
+  let errMsg = null;
+  for (const line of String(text).split(/\r?\n/)) {
+    const m = line.match(/^data:\s?(.*)$/);
+    if (!m) continue;
+    const payload = m[1].trim();
+    if (payload === '[DONE]') { sawDone = true; continue; }
+    try {
+      const j = JSON.parse(payload);
+      if (j && j.error) {
+        errMsg = (j.error.message || j.error.msg || JSON.stringify(j.error));
+        continue;
+      }
+      const ch = j && j.choices && j.choices[0];
+      const piece = ch && ch.delta && ch.delta.content !== undefined
+        ? ch.delta.content
+        : (ch && ch.message && ch.message.content);
+      if (typeof piece === 'string') content += piece;
+    } catch (_) { /* 非 JSON 行（心跳/注释）忽略 */ }
+  }
+  return { ok: sawDone || content.length > 0, content, errMsg };
+}
+
+/**
+ * 向聊天网关发送一条流式短消息，在账号下产生使用记录。
+ * 端点只支持 stream=true（非流式返回 400/11101），因此按 SSE 解析回复。
+ * 任一域名成功即视为 OK；全部失败只记录结论，绝不影响签到退出码。
  */
 async function sendDailyMessage(headers) {
   if (!CHAT_ENABLED) {
@@ -206,59 +238,57 @@ async function sendDailyMessage(headers) {
 
   const chatHeaders = {
     ...headers,
-    Accept: 'application/json, text/event-stream',
+    Accept: 'text/event-stream',
   };
   const chatBody = {
     model: CHAT_MODEL,
     messages: [{ role: 'user', content: CHAT_TEXT }],
-    stream: false,
+    stream: true,
   };
 
   for (const host of CHAT_HOSTS) {
-    for (const p of CHAT_PATHS) {
-      const url = host + p;
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 30000);
-      let r;
-      try {
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: chatHeaders,
-          body: JSON.stringify(chatBody),
-          signal: ctrl.signal,
-        });
-        r = { http: res.status, body: await res.text() };
-      } catch (e) {
-        r = { http: 0, body: '', err: e.name === 'AbortError' ? '请求超时' : (e.message || String(e)) };
-      } finally {
-        clearTimeout(timer);
-      }
+    const url = host + CHAT_PATH;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 60000);
+    let r;
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: chatHeaders,
+        body: JSON.stringify(chatBody),
+        signal: ctrl.signal,
+      });
+      r = { http: res.status, body: await res.text() };
+    } catch (e) {
+      r = { http: 0, body: '', err: e.name === 'AbortError' ? '请求超时' : (e.message || String(e)) };
+    } finally {
+      clearTimeout(timer);
+    }
 
-      const brief = (r.err ? r.err : r.body.slice(0, 200)).replace(/\s+/g, ' ');
-      log(`每日消息尝试 ${url} → HTTP ${r.http}${r.err ? '（' + r.err + '）' : ''} ${brief}`);
+    const brief = (r.err ? r.err : r.body.slice(0, 200)).replace(/\s+/g, ' ');
+    log(`每日消息尝试 ${url} → HTTP ${r.http}${r.err ? '（' + r.err + '）' : ''} ${brief}`);
 
-      if (r.http >= 200 && r.http < 300) {
-        let ok = true;
+    if (r.http >= 200 && r.http < 300) {
+      const p = parseSSE(r.body);
+      if (p.ok) {
+        const reply = p.content ? p.content.slice(0, 60).replace(/\s+/g, ' ') : '(空回复)';
+        log(`每日消息回复片段：${reply}`);
+        log(`MESSAGE-RESULT: OK（${url}，model=${CHAT_MODEL}）`);
         try {
-          const j = JSON.parse(r.body);
-          if (j && j.error) ok = false; // OpenAI 风格 200 内嵌错误
-        } catch (_) { /* 非 JSON 的 2xx（如 SSE 片段）也视为已受理 */ }
-        if (ok) {
-          log(`MESSAGE-RESULT: OK（${url}，model=${CHAT_MODEL}）`);
-          try {
-            if (process.env.GITHUB_OUTPUT) {
-              fs.appendFileSync(process.env.GITHUB_OUTPUT, `message_result=OK\n`, 'utf8');
-            }
-          } catch (_) { /* ignore */ }
-          return;
-        }
+          if (process.env.GITHUB_OUTPUT) {
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `message_result=OK\n`, 'utf8');
+          }
+        } catch (_) { /* ignore */ }
+        return;
       }
+      log(`每日消息：HTTP 2xx 但流内未获有效回复${p.errMsg ? '（' + p.errMsg + '）' : ''}，尝试下一域名`);
+      continue;
+    }
 
-      // 401/403 说明网关不认这个令牌形式，换域名也大概率一样，直接结束
-      if (r.http === 401 || r.http === 403) {
-        log('每日消息：网关拒绝令牌（401/403），停止尝试');
-        break;
-      }
+    // 401/403 说明网关不认这个令牌形式，换域名也大概率一样，直接结束
+    if (r.http === 401 || r.http === 403) {
+      log('每日消息：网关拒绝令牌（401/403），停止尝试');
+      break;
     }
   }
 
