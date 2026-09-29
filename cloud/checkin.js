@@ -1,18 +1,30 @@
 #!/usr/bin/env node
 /**
- * checkin.js — WorkBuddy 每日积分签到（云端正交实现，GitHub Actions / 任意 Node 环境）
+ * checkin.js — WorkBuddy 每日签到 + 每日消息（云端实现，GitHub Actions / 任意 Node 环境）
  *
  * 与本地版 scripts/checkin.js 的区别：
  *   本地版从 WorkBuddy 桌面端的本地登录态文件读取令牌；
  *   本版从环境变量 WORKBUDDY_AUTH 读取调用方预先导出的登录态 JSON（文件中转）。
- *   签到业务逻辑（接口、业务码、幂等、返回语义）与本地版保持一致。
+ *
+ * 签到：POST /v2/billing/meter/daily-checkin，业务码 10001（今日已签到）视为成功。
+ * 每日消息：签到完成后向 WorkBuddy 聊天网关发一条短消息（默认 model=hy3-free，
+ *   内容「你好」），在账号下产生除积分外的使用记录。发消息属附加动作，
+ *   全部候选端点失败只记录 MESSAGE-RESULT: FAILED，不影响签到退出码。
  *
  * 用法：
  *   WORKBUDDY_AUTH_FILE=<json路径> node cloud/checkin.js
  *   WORKBUDDY_AUTH=<json字符串>   node cloud/checkin.js
  *
+ * 可选环境变量：
+ *   WB_SEND_MESSAGE=0        关闭每日消息（默认开启）
+ *   WB_CHAT_MODEL=hy3-free   消息使用的模型
+ *   WB_CHAT_TEXT=你好        消息内容
+ *   WB_CHECKIN_JITTER=120    启动前随机等待秒数上限
+ *   WB_CHECKIN_WARN_DAYS=10  令牌到期预警阈值（天）
+ *
  * 结果：stdout 末尾打印 RESULT: SUCCESS | ALREADY | FAILED
- * 退出码：0 = 成功（含今日已签到），1 = 失败
+ *       消息结果单独一行 MESSAGE-RESULT: OK | FAILED | SKIPPED
+ * 退出码：0 = 成功（含今日已签到），1 = 签到失败（消息失败不影响退出码）
  *
  * 幂等：先查状态；daily-checkin 返回 code=10001（今日已签到）同样视为成功。
  * 安全：令牌仅在内存中使用，不落盘、不回显；异常信息中不含令牌原文。
@@ -171,13 +183,115 @@ function pick(obj, keys) {
   return null;
 }
 
+/* ---------- 3. 每日消息 ---------- */
+
+const CHAT_ENABLED = (process.env.WB_SEND_MESSAGE || '1') !== '0';
+const CHAT_MODEL = process.env.WB_CHAT_MODEL || 'hy3-free';
+const CHAT_TEXT = process.env.WB_CHAT_TEXT || '你好';
+const CHAT_HOSTS = ['https://copilot.tencent.com', 'https://www.workbuddy.cn'];
+const CHAT_PATHS = ['/v2/chat/completions', '/v1/chat/completions'];
+
+/**
+ * 向聊天网关发送一条短消息，在账号下产生使用记录。
+ * 桌面端主聊天走本地代理 + 流式协议，无公开的纯 HTTP 收消息端点，
+ * 因此按「域名 × 路径」逐个尝试 OpenAI 兼容端点；任何一个 2xx 即视为成功。
+ * 全部失败只记录结论，绝不抛出、绝不影响签到退出码。
+ */
+async function sendDailyMessage(headers) {
+  if (!CHAT_ENABLED) {
+    log('每日消息：未启用（WB_SEND_MESSAGE=0），跳过');
+    log('MESSAGE-RESULT: SKIPPED');
+    return;
+  }
+
+  const chatHeaders = {
+    ...headers,
+    Accept: 'application/json, text/event-stream',
+  };
+  const chatBody = {
+    model: CHAT_MODEL,
+    messages: [{ role: 'user', content: CHAT_TEXT }],
+    stream: false,
+  };
+
+  for (const host of CHAT_HOSTS) {
+    for (const p of CHAT_PATHS) {
+      const url = host + p;
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 30000);
+      let r;
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: chatHeaders,
+          body: JSON.stringify(chatBody),
+          signal: ctrl.signal,
+        });
+        r = { http: res.status, body: await res.text() };
+      } catch (e) {
+        r = { http: 0, body: '', err: e.name === 'AbortError' ? '请求超时' : (e.message || String(e)) };
+      } finally {
+        clearTimeout(timer);
+      }
+
+      const brief = (r.err ? r.err : r.body.slice(0, 200)).replace(/\s+/g, ' ');
+      log(`每日消息尝试 ${url} → HTTP ${r.http}${r.err ? '（' + r.err + '）' : ''} ${brief}`);
+
+      if (r.http >= 200 && r.http < 300) {
+        let ok = true;
+        try {
+          const j = JSON.parse(r.body);
+          if (j && j.error) ok = false; // OpenAI 风格 200 内嵌错误
+        } catch (_) { /* 非 JSON 的 2xx（如 SSE 片段）也视为已受理 */ }
+        if (ok) {
+          log(`MESSAGE-RESULT: OK（${url}，model=${CHAT_MODEL}）`);
+          try {
+            if (process.env.GITHUB_OUTPUT) {
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, `message_result=OK\n`, 'utf8');
+            }
+          } catch (_) { /* ignore */ }
+          return;
+        }
+      }
+
+      // 401/403 说明网关不认这个令牌形式，换域名也大概率一样，直接结束
+      if (r.http === 401 || r.http === 403) {
+        log('每日消息：网关拒绝令牌（401/403），停止尝试');
+        break;
+      }
+    }
+  }
+
+  log(`MESSAGE-RESULT: FAILED（所有候选端点均未成功，不影响签到）`);
+  try {
+    if (process.env.GITHUB_OUTPUT) {
+      fs.appendFileSync(process.env.GITHUB_OUTPUT, `message_result=FAILED\n`, 'utf8');
+    }
+  } catch (_) { /* ignore */ }
+}
+
+/**
+ * 统一出口：先尝试发每日消息（异常吞掉），再以签到结论退出。
+ */
+async function exitWith(result, msg, headers) {
+  if (headers) {
+    try {
+      await sendDailyMessage(headers);
+    } catch (e) {
+      log(`每日消息异常（已忽略）：${e && e.message ? e.message : e}`);
+      log('MESSAGE-RESULT: FAILED');
+    }
+  }
+  process.exit(finish(result, msg));
+}
+
 /* ---------- main ---------- */
 (async function main() {
   jitter();
 
   const tok = getToken();
   if (!tok.ok) {
-    process.exit(finish('FAILED', `获取登录态失败：${tok.error}`));
+    await exitWith('FAILED', `获取登录态失败：${tok.error}`, null);
   }
   log(`登录态来源：${tok.source}`);
 
@@ -191,7 +305,7 @@ function pick(obj, keys) {
     Authorization: `Bearer ${tok.accessToken}`,
     'Content-Type': 'application/json',
     Accept: 'application/json',
-    'User-Agent': 'WorkBuddy-Checkin/1.0.4',
+    'User-Agent': 'WorkBuddy-Checkin/1.1.0',
   };
   if (tok.uid) headers['X-User-Id'] = tok.uid;
   if (tok.domain) headers['X-Domain'] = tok.domain;
@@ -215,14 +329,14 @@ function pick(obj, keys) {
       if (Number(total) > 0) info.push(`积分余额 ${total}`);
       if (info.length) log(`当前状态：${info.join('，')}`);
       if (flag === true || flag === 'true') {
-        process.exit(finish('ALREADY', '今日已签到（状态接口命中），跳过。'));
+        await exitWith('ALREADY', '今日已签到（状态接口命中），跳过。', headers);
       }
     }
   } catch (_) { /* 状态查询失败不阻断，继续签到 */ }
 
   // 执行签到
   const res = await api(CHECKIN_URL, headers);
-  if (res.err) { process.exit(finish('FAILED', `签到请求异常：${res.err}`)); }
+  if (res.err) { await exitWith('FAILED', `签到请求异常：${res.err}`, headers); }
 
   // 该网关用 HTTP 400 承载业务码（code=10001 今天已签到就是 400 返回），
   // 因此必须先解析业务码，不能先把非 2xx 一律判为失败。
@@ -235,7 +349,7 @@ function pick(obj, keys) {
     const msg = rj.msg || rj.message || '';
 
     if (code === '10001') {
-      process.exit(finish('ALREADY', `今日已签到（code=10001${msg ? '，' + msg : ''}），无需重复领取。`));
+      await exitWith('ALREADY', `今日已签到（code=10001${msg ? '，' + msg : ''}），无需重复领取。`, headers);
     }
     if (code === '0' || code === '200' || code === 'success' || rawCode === 0) {
       const data = rj.data || rj;
@@ -244,28 +358,28 @@ function pick(obj, keys) {
       const detail = [];
       if (credits !== null && credits !== undefined) detail.push(`获得 ${credits} 积分`);
       if (streak !== null && streak !== undefined) detail.push(`连续 ${streak} 天`);
-      process.exit(finish('SUCCESS', `签到成功${detail.length ? '（' + detail.join('，') + '）' : ''}`));
+      await exitWith('SUCCESS', `签到成功${detail.length ? '（' + detail.join('，') + '）' : ''}`, headers);
     }
     if (res.http === 401 || res.http === 403) {
-      process.exit(finish('FAILED',
+      await exitWith('FAILED',
         `令牌已过期或无效（HTTP ${res.http}，code=${code}）。请在本机重新登录 WorkBuddy 桌面端，` +
-        '导出登录态后更新 WORKBUDDY_AUTH。'));
+        '导出登录态后更新 WORKBUDDY_AUTH。', headers);
     }
-    process.exit(finish('FAILED', `签到未成功：code=${code} ${msg}（HTTP ${res.http}）`));
+    await exitWith('FAILED', `签到未成功：code=${code} ${msg}（HTTP ${res.http}）`, headers);
   }
 
   // 无 JSON 响应体：此时才用 HTTP 状态码判定
   if (res.http === 401 || res.http === 403) {
-    process.exit(finish('FAILED',
-      `令牌已过期或无效（HTTP ${res.http}）。请在本机重新登录 WorkBuddy 桌面端，导出登录态后更新 WORKBUDDY_AUTH。`));
+    await exitWith('FAILED',
+      `令牌已过期或无效（HTTP ${res.http}）。请在本机重新登录 WorkBuddy 桌面端，导出登录态后更新 WORKBUDDY_AUTH。`, headers);
   }
   if (res.http >= 500) {
-    process.exit(finish('FAILED', `服务端错误：HTTP ${res.http}`));
+    await exitWith('FAILED', `服务端错误：HTTP ${res.http}`, headers);
   }
   if (res.http < 200 || res.http >= 300) {
-    process.exit(finish('FAILED', `签到请求失败：HTTP ${res.http}`));
+    await exitWith('FAILED', `签到请求失败：HTTP ${res.http}`, headers);
   }
-  process.exit(finish('SUCCESS', '签到请求已发出并返回 HTTP 200（响应非 JSON）。'));
-})().catch((e) => {
-  process.exit(finish('FAILED', `签到脚本异常：${e && e.message ? e.message : e}`));
+  await exitWith('SUCCESS', '签到请求已发出并返回 HTTP 200（响应非 JSON）。', headers);
+})().catch(async (e) => {
+  await exitWith('FAILED', `签到脚本异常：${e && e.message ? e.message : e}`, null);
 });
