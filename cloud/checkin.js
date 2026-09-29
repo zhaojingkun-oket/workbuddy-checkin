@@ -7,9 +7,10 @@
  *   本版从环境变量 WORKBUDDY_AUTH 读取调用方预先导出的登录态 JSON（文件中转）。
  *
  * 签到：POST /v2/billing/meter/daily-checkin，业务码 10001（今日已签到）视为成功。
- * 每日消息：签到完成后向 WorkBuddy 聊天网关发一条短消息（默认 model=hy3-free，
- *   内容「你好」），在账号下产生除积分外的使用记录。发消息属附加动作，
- *   全部候选端点失败只记录 MESSAGE-RESULT: FAILED，不影响签到退出码。
+ * 每日消息：签到完成后向 WorkBuddy 聊天网关发一条短消息（默认 model=hy3，
+ *   即界面上的 Hy3 Free，内容「你好」），在账号下产生除积分外的使用记录。
+ *   发消息属附加动作，全部候选端点失败只记录 MESSAGE-RESULT: FAILED，
+ *   不影响签到退出码。
  *
  * 用法：
  *   WORKBUDDY_AUTH_FILE=<json路径> node cloud/checkin.js
@@ -186,7 +187,8 @@ function pick(obj, keys) {
 /* ---------- 3. 每日消息 ---------- */
 
 const CHAT_ENABLED = (process.env.WB_SEND_MESSAGE || '1') !== '0';
-const CHAT_MODEL = process.env.WB_CHAT_MODEL || 'hy3-free';
+// API 层模型名是 hy3（UI 上显示为 Hy3 Free）；注册表 id "hy3-free" 网关不认（400/11102）
+const CHAT_MODEL = process.env.WB_CHAT_MODEL || 'hy3';
 const CHAT_TEXT = process.env.WB_CHAT_TEXT || '你好';
 // 2026-09-29 实测：两个域名的 /v2/chat/completions 都存在（v1 是 404），
 // 且只支持流式请求——非流式返回 HTTP 400 code=11101
